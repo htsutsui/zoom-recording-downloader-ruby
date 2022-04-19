@@ -14,7 +14,7 @@ Ruby script to download zoom cloud recordings to your computer.
     ![](images/permission.png)
 
 -   Put your app's `CLIENT_ID` and `CLIENT_SECRET` to `config.rb`.
-    See `config_sample.rb`.
+    See [`config_sample.rb`](config_sample.rb).
 
     ![](images/client_info.png)
 
