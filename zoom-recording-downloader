@@ -1,0 +1,153 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require './config'
+require 'time'
+require 'curb'
+require 'socket'
+require 'yaml'
+require 'json'
+require 'base64'
+
+module Zoom
+  class << self
+    def server_main(client)
+      code = nil
+      while (l = client.gets.strip)
+        break if l.empty?
+
+        if l =~ /^GET (\S+)/
+          code = $1.scan(%r{/?code=(\S+)})[0][0]
+          break
+        end
+      end
+      data = <<~DATA
+        HTTP/1.1 200 OK
+        Content-Type: text/plain
+
+        OK
+      DATA
+      client.write(data)
+      client.close
+      code
+    end
+
+    def oauth
+      url = "https://zoom.us/oauth/authorize?response_type=code&client_id=#{CLIENT_ID}&redirect_uri=#{REDIRECT_URI}"
+      res = Curl.get(url)
+      raise if res.response_code != 302
+
+      headers = res.header_str.scan(/^(\S+): (.*)$/)
+      headers = Hash[headers].transform_values(&:strip)
+      print "open #{headers['location'].strip}\n"
+
+      server_main(TCPServer.new(REDIRECT_PORT).accept)
+    end
+
+    def get_token(code)
+      base64 = Zoom.base64
+      a = { 'code' => code,
+            'grant_type' => 'authorization_code',
+            'redirect_uri' => REDIRECT_URI }
+      a = a.map { |i| i.join('=') }.join('&')
+      e = Curl::Easy.new('https://zoom.us/oauth/token')
+      e.headers['Authorization'] = "Basic #{base64}"
+      e.http_post(a)
+      JSON.parse(e.body)
+    end
+
+    def auth
+      code = Zoom.oauth
+      open('token.yaml', 'w') { |fp| fp.write(YAML.dump(Zoom.get_token(code))) }
+    end
+  end
+end
+
+module Zoom
+  class Error404 < RuntimeError
+  end
+  class << self
+    def base64
+      Base64.strict_encode64("#{CLIENT_ID}:#{CLIENT_SECRET}")
+    end
+
+    def token
+      return @token if @token
+
+      filename = 'token.yaml'
+      @token = if File.exist?(filename)
+                 YAML.load_file('token.yaml')['access_token']
+               else
+                 Zoom.auth
+                 token
+               end
+    end
+
+    def bearer_get(url, again: false)
+      e = Curl::Easy.new(url)
+      e.headers['Authorization'] = "Bearer #{token}"
+      e.follow_location = true
+      e.http_get
+      if e.response_code != 200
+        raise Error404, url if e.response_code == 404
+
+        if e.response_code == 401 && !again
+          # Unauthorized response status code
+          Zoom.auth
+          @token = nil
+          return bearer_get(url, again: true)
+        end
+        pp url
+        pp e.response_code
+        raise
+      end
+
+      e.body
+    end
+
+    def api(path, param = nil)
+      url = "https://api.zoom.us/v2#{path}"
+      unless param.nil?
+        a = param.map { |i| i.join('=') }.join('&')
+        url = "#{url}?#{a}"
+      end
+      b = bearer_get(url)
+      begin
+        JSON.parse(b)
+      rescue JSON::ParserError
+        b
+      end
+    end
+
+    def fetch_recordings
+      param = { 'from' => (Date.today - 14).strftime('%Y-%m-%d') }
+      r = Zoom.api('/users/me/recordings', param)
+      print %w[from to].map { |i| "#{[i, r[i]].join(': ')}\n" }.join
+      r['meetings'].each do |i|
+        print "Topic: #{i['topic']}\n"
+        i['recording_files'].each do |j|
+          time = Time.parse(j['recording_start']).localtime
+          if j['status'] == 'processing'
+            print "  #{time}: processing\n"
+            next
+          end
+
+          ext = j['file_extension'].downcase
+          next if ext == 'm4a'
+
+          url = j['download_url']
+          if File.exist?(file = time.strftime("%Y%m%d%H%M.#{ext}"))
+            print "  Already exists: #{file}\n"
+            next
+          end
+
+          print "  Getting: #{file}\n"
+          data = Zoom.bearer_get(url)
+          File.open(file, 'w').write(data)
+        end
+      end
+    end
+  end
+end
+
+Zoom.fetch_recordings if __FILE__ == $PROGRAM_NAME
