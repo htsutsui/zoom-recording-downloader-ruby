@@ -90,13 +90,14 @@ class RecordingFilesInfo < Hash
 
   def process
     time = Time.parse(self['recording_start']).localtime
+    name = time.strftime('%Y%m%d%H%M')
     if self['status'] == 'processing'
-      print "  #{time}: processing\n"
+      print "  Processing: #{name}\n"
       return
     end
     return if (ext = self['file_extension'].downcase) == 'm4a'
 
-    self.class.download(time.strftime("%Y%m%d%H%M.#{ext}"),
+    self.class.download(time.strftime("#{name}.#{ext}"),
                         self['download_url'])
   end
 end
