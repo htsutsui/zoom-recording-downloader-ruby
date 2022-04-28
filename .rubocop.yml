@@ -1,16 +1,4 @@
-Metrics/AbcSize:
-  Enabled: false
-Metrics/BlockLength:
-  Enabled: false
-Metrics/CyclomaticComplexity:
-  Enabled: false
-Metrics/MethodLength:
-  Enabled: false
-Metrics/PerceivedComplexity:
-  Enabled: false
+AllCops:
+  NewCops: enable
 Style/Documentation:
-  Enabled: false
-Style/PerlBackrefs:
-  Enabled: false
-Style/AsciiComments:
   Enabled: false
