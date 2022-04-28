@@ -88,17 +88,25 @@ class RecordingFilesInfo < Hash
     end
   end
 
+  def method_missing(sym)
+    self[sym.to_s]
+  end
+
+  def respond_to_missing?(sym, _include_private)
+    keys.include?(sym.to_s)
+  end
+
   def process
-    time = Time.parse(self['recording_start']).localtime
+    time = Time.parse(recording_start).localtime
     name = time.strftime('%Y%m%d%H%M')
-    if self['status'] == 'processing'
+    if status == 'processing'
       print "  Processing: #{name}\n"
       return
     end
-    return if (ext = self['file_extension'].downcase) == 'm4a'
+    return if (ext = file_extension.downcase) == 'm4a'
 
     self.class.download(time.strftime("#{name}.#{ext}"),
-                        self['download_url'])
+                        download_url)
   end
 end
 
