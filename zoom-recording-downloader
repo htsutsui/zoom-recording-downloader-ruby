@@ -4,62 +4,101 @@
 require './config'
 require 'time'
 require 'curb'
-require 'socket'
 require 'yaml'
 require 'json'
 require 'base64'
+require 'webrick'
 
-module Zoom
+class MyHTTPServer
   class << self
-    def server_main(client)
+    def main(port)
+      srv = WEBrick::HTTPServer.new(Port: port,
+                                    Logger: WEBrick::Log.new('/dev/null'),
+                                    AccessLog: [])
       code = nil
-      while (l = client.gets.strip)
-        break if l.empty?
-
-        if l =~ /^GET (\S+)/
-          code = $1.scan(%r{/?code=(\S+)})[0][0]
-          break
-        end
-      end
-      data = <<~DATA
-        HTTP/1.1 200 OK
-        Content-Type: text/plain
-
-        OK
-      DATA
-      client.write(data)
-      client.close
+      srv.mount_proc('/') { |req, res| code = srv_proc(srv, req, res) }
+      srv.start
       code
     end
 
+    private
+
+    def srv_proc(srv, req, res)
+      raise unless req.request_line =~ %r{^GET /\?code=(\S+)}
+
+      res.body = 'OK'
+      res.content_type = 'text/plain'
+      srv.shutdown
+      Regexp.last_match(1)
+    end
+  end
+end
+
+module Zoom
+  class << self
     def oauth
       url = "https://zoom.us/oauth/authorize?response_type=code&client_id=#{CLIENT_ID}&redirect_uri=#{REDIRECT_URI}"
       res = Curl.get(url)
       raise if res.response_code != 302
 
       headers = res.header_str.scan(/^(\S+): (.*)$/)
-      headers = Hash[headers].transform_values(&:strip)
+      headers = headers.to_h.transform_values(&:strip)
       print "open #{headers['location'].strip}\n"
 
-      server_main(TCPServer.new(REDIRECT_PORT).accept)
+      MyHTTPServer.main(REDIRECT_PORT)
     end
 
     def get_token(code)
-      base64 = Zoom.base64
       a = { 'code' => code,
             'grant_type' => 'authorization_code',
             'redirect_uri' => REDIRECT_URI }
       a = a.map { |i| i.join('=') }.join('&')
       e = Curl::Easy.new('https://zoom.us/oauth/token')
+      base64 = Base64.strict_encode64("#{CLIENT_ID}:#{CLIENT_SECRET}")
       e.headers['Authorization'] = "Basic #{base64}"
       e.http_post(a)
       JSON.parse(e.body)
     end
 
     def auth
-      code = Zoom.oauth
-      open('token.yaml', 'w') { |fp| fp.write(YAML.dump(Zoom.get_token(code))) }
+      token = Zoom.get_token(Zoom.oauth)
+      open('token.yaml', 'w') { |fp| fp.write(YAML.dump(token)) }
+      token
     end
+  end
+end
+
+class RecordingFilesInfo < Hash
+  class << self
+    def download(filename, url)
+      if File.exist?(filename)
+        print "  Already exists: #{filename}\n"
+      else
+        print "  Getting: #{filename}\n"
+        File.write(filename, Zoom.bearer_get(url))
+      end
+    end
+  end
+
+  def method_missing(sym)
+    self[sym.to_s]
+  end
+
+  def respond_to_missing?(sym, _include_private)
+    keys.include?(sym.to_s)
+  end
+
+  def process
+    time = Time.parse(recording_start).localtime
+    name = time.strftime('%Y%m%d%H%M')
+    if status == 'processing'
+      print "  Processing: #{name}\n"
+      return
+    end
+    return if (ext = file_extension.downcase) == 'm4a'
+
+    self.class.download(time.strftime("#{name}.#{ext}"),
+                        download_url)
   end
 end
 
@@ -67,50 +106,44 @@ module Zoom
   class Error404 < RuntimeError
   end
   class << self
-    def base64
-      Base64.strict_encode64("#{CLIENT_ID}:#{CLIENT_SECRET}")
-    end
-
-    def token
-      return @token if @token
+    def token(force: false)
+      return @token if !force && @token
 
       filename = 'token.yaml'
-      @token = if File.exist?(filename)
-                 YAML.load_file('token.yaml')['access_token']
+      @token = if !force && File.exist?(filename)
+                 YAML.load_file('token.yaml')
                else
                  Zoom.auth
-                 token
                end
+      @token = @token['access_token']
     end
 
-    def bearer_get(url, again: false)
+    def bearer_get_curl(url)
       e = Curl::Easy.new(url)
       e.headers['Authorization'] = "Bearer #{token}"
       e.follow_location = true
-      e.http_get
-      if e.response_code != 200
-        raise Error404, url if e.response_code == 404
-
-        if e.response_code == 401 && !again
-          # Unauthorized response status code
-          Zoom.auth
-          @token = nil
-          return bearer_get(url, again: true)
-        end
-        pp url
-        pp e.response_code
-        raise
-      end
-
-      e.body
+      e.http_get && e
     end
 
-    def api(path, param = nil)
-      url = "https://api.zoom.us/v2#{path}"
-      unless param.nil?
-        a = param.map { |i| i.join('=') }.join('&')
-        url = "#{url}?#{a}"
+    def bearer_get(url, again: false)
+      e = bearer_get_curl(url)
+      return e.body if e.response_code == 200
+      raise Error404, url if e.response_code == 404
+
+      if e.response_code == 401 && !again
+        # Unauthorized response status code
+        token(force: true)
+        return bearer_get(url, again: true)
       end
+      pp url
+      pp e.response_code
+      raise
+    end
+
+    def api(path, param = [])
+      url = "https://api.zoom.us/v2#{path}"
+      a = param.map { |i| i.join('=') }.join('&')
+      url = "#{url}?#{a}" unless a.empty?
       b = bearer_get(url)
       begin
         JSON.parse(b)
@@ -120,31 +153,12 @@ module Zoom
     end
 
     def fetch_recordings
-      param = { 'from' => (Date.today - 14).strftime('%Y-%m-%d') }
-      r = Zoom.api('/users/me/recordings', param)
-      print %w[from to].map { |i| "#{[i, r[i]].join(': ')}\n" }.join
+      r = Zoom.api('/users/me/recordings',
+                   { 'from' => (Date.today - 14).strftime('%Y-%m-%d') })
+      print %w[from to].map { |i| r[i] }.join(' - '), "\n"
       r['meetings'].each do |i|
         print "Topic: #{i['topic']}\n"
-        i['recording_files'].each do |j|
-          time = Time.parse(j['recording_start']).localtime
-          if j['status'] == 'processing'
-            print "  #{time}: processing\n"
-            next
-          end
-
-          ext = j['file_extension'].downcase
-          next if ext == 'm4a'
-
-          url = j['download_url']
-          if File.exist?(file = time.strftime("%Y%m%d%H%M.#{ext}"))
-            print "  Already exists: #{file}\n"
-            next
-          end
-
-          print "  Getting: #{file}\n"
-          data = Zoom.bearer_get(url)
-          File.open(file, 'w').write(data)
-        end
+        i['recording_files'].each { |j| RecordingFilesInfo[j].process }
       end
     end
   end
