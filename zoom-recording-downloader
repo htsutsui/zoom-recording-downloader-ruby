@@ -4,40 +4,32 @@
 require './config'
 require 'time'
 require 'curb'
-require 'socket'
 require 'yaml'
 require 'json'
 require 'base64'
+require 'webrick'
 
-class MyHTTPServer < TCPServer
+class MyHTTPServer
   class << self
     def main(port)
-      server_main(new(port).accept)
+      srv = WEBrick::HTTPServer.new(Port: port,
+                                    Logger: WEBrick::Log.new('/dev/null'),
+                                    AccessLog: [])
+      code = nil
+      srv.mount_proc('/') { |req, res| code = srv_proc(srv, req, res) }
+      srv.start
+      code
     end
 
     private
 
-    def get_code(io_port)
-      while (l = io_port.gets.strip)
-        break if l.empty?
+    def srv_proc(srv, req, res)
+      raise unless req.request_line =~ %r{^GET /\?code=(\S+)}
 
-        re = %r{/?code=(\S+)}
-        return Regexp.last_match(1).scan(re)[0][0] if l =~ /^GET (\S+)/
-      end
-      raise
-    end
-
-    def server_main(client)
-      code = get_code(client)
-      data = <<~DATA
-        HTTP/1.1 200 OK
-        Content-Type: text/plain
-
-        OK
-      DATA
-      client.write(data)
-      client.close
-      code
+      res.body = 'OK'
+      res.content_type = 'text/plain'
+      srv.shutdown
+      Regexp.last_match(1)
     end
   end
 end
